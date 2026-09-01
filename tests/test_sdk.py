@@ -6,6 +6,7 @@ import unittest
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from unittest.mock import patch
 
 from watchwebhook import (
     ConfigurationError,
@@ -54,6 +55,7 @@ class SDKBehaviorTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
         cls.thread.join()
+        cls.server.server_close()
 
     def setUp(self) -> None:
         _Receiver.requests.clear()
@@ -70,18 +72,23 @@ class SDKBehaviorTests(unittest.TestCase):
         )
 
     def test_webhook_is_authenticated_redacted_and_json_safe(self) -> None:
-        event = self._client().start_webhook(
-            method="post",
-            url="https://orders.example/hook",
-            headers={"Authorization": "secret", "X-Request-ID": 7},
-            query={"attempt": 2},
-            body=b"{\"ok\":true}",
-            source="stripe",
-            metadata={"received_at": datetime(2026, 1, 1, tzinfo=timezone.utc)},
-        )
+        with patch(
+            "watchwebhook.client.monotonic_ns",
+            side_effect=[1_000_000_000, 1_250_000_000],
+        ):
+            event = self._client().start_webhook(
+                method="post",
+                url="https://orders.example/hook",
+                headers={"Authorization": "secret", "X-Request-ID": 7},
+                query={"attempt": 2},
+                body=b"{\"ok\":true}",
+                source="stripe",
+                metadata={"received_at": datetime(2026, 1, 1, tzinfo=timezone.utc)},
+                occurred_at=datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+            )
 
-        self.assertFalse(_Receiver.ready.is_set())
-        result = event.success(status_code=200)
+            self.assertFalse(_Receiver.ready.is_set())
+            result = event.success(status_code=200)
 
         self.assertTrue(_Receiver.ready.wait(1))
         request = _Receiver.requests[0]
@@ -97,6 +104,8 @@ class SDKBehaviorTests(unittest.TestCase):
         self.assertEqual(envelope["payload"]["method"], "POST")
         self.assertEqual(envelope["payload"]["outcome"], "success")
         self.assertEqual(envelope["payload"]["status_code"], 200)
+        self.assertEqual(envelope["payload"]["received_at"], "2026-01-02T03:04:05Z")
+        self.assertEqual(envelope["payload"]["time_took_ms"], 250.0)
         self.assertNotIn("error", envelope["payload"])
         self.assertNotIn("headers", envelope["payload"])
         self.assertNotIn("query", envelope["payload"])
@@ -162,6 +171,9 @@ class SDKBehaviorTests(unittest.TestCase):
         payload = _Receiver.requests[0]["body"]["payload"]
         self.assertEqual(payload["outcome"], "failure")
         self.assertEqual(payload["status_code"], 422)
+        self.assertIn("received_at", payload)
+        self.assertIsInstance(payload["time_took_ms"], float)
+        self.assertGreaterEqual(payload["time_took_ms"], 0)
         self.assertEqual(payload["error"]["exception_type"], "RuntimeError")
         self.assertEqual(payload["error"]["message"], "payment failed")
         self.assertEqual(payload["headers"]["Authorization"], "[REDACTED]")

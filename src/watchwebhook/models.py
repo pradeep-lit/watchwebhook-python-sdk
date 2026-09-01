@@ -125,6 +125,8 @@ class CapturedWebhook:
     body_encoding: str | None
     source: str | None
     metadata: dict[str, Any]
+    received_at: datetime
+    time_took_ms: float | None
     outcome: WebhookOutcome
     status_code: int | None
     error: dict[str, Any] | None
@@ -137,6 +139,8 @@ class CapturedWebhook:
             "metadata": self.metadata,
             "outcome": self.outcome,
             "status_code": self.status_code,
+            "received_at": format_datetime(self.received_at),
+            "time_took_ms": self.time_took_ms,
         }
         if self.outcome == "failure":
             payload.update(

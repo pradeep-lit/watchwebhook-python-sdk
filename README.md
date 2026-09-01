@@ -15,38 +15,52 @@ pip install watchwebhook-python-sdk
 ## Quick start
 
 ```python
+from flask import Flask, request
+
 from watchwebhook import WatchWebhook
+
+app = Flask(__name__)
 
 watchwebhook = WatchWebhook(
     api_key="whk_live_...",
     project_id="orders-api",
 )
 
-# The SDK records the request but does not consume it or run business logic.
-event = watchwebhook.start_webhook(
-    source="stripe",
-    method=request.method,
-    url=request.url,
-    headers=request.headers,
-    query=request.args,
-    body=request.get_data(),
-)
 
-try:
-    body = request.get_data()
-    parsed = parse_stripe_event(body)
-    process_order(parsed)
+@app.post("/webhooks/stripe")
+def receive_stripe_webhook():
+    # Read the body once. Flask caches it, so both WatchWebhook and your
+    # business code receive the same bytes.
+    body = request.get_data(cache=True)
 
-    # One terminal result is required for each started webhook.
+    # This only creates a local lifecycle handle. No API request is sent yet.
+    event = watchwebhook.start_webhook(
+        source="stripe",
+        method=request.method,
+        url=request.url,
+        headers=request.headers,
+        query=request.args,
+        body=body,
+    )
+
+    try:
+        # These are functions from your application. Verify the provider's
+        # signature while parsing before trusting or processing the payload.
+        stripe_event = parse_and_verify_stripe_event(
+            body=body,
+            signature=request.headers.get("Stripe-Signature"),
+        )
+        process_payment_event(stripe_event)
+    except Exception as exc:
+        # Sends the full body, query, redacted headers, traceback,
+        # received_at, and time_took_ms. Re-raise so Flask keeps your normal
+        # error handling and Stripe can retry the webhook.
+        event.fail(error=exc, status_code=500)
+        raise
+
+    # Sends only the reduced success payload plus received_at and time_took_ms.
     event.success(status_code=200)
-except Exception as exc:
-    event.fail(error=exc, status_code=500)
-    raise
-
-watchwebhook.capture_event(
-    "order.fulfilled",
-    {"order_id": order.id, "amount": order.total},
-)
+    return {"received": True}, 200
 ```
 
 For a self-hosted backend, change only the endpoint:
@@ -66,6 +80,10 @@ watchwebhook = WatchWebhook(
   completed with exactly one `event.success()` or `event.fail(...)`. The
   terminal call sends the webhook record, including the application's result.
   The original request body remains available for business processing.
+- `received_at` is the UTC time captured by `start_webhook()`.
+  `time_took_ms` is the elapsed business-processing time until `success()` or
+  `fail()` is called. Duration uses Python's monotonic clock, so system clock
+  corrections cannot make it jump backward.
 - Successful webhook records include only routing and outcome fields
   (`method`, `url`, `source`, metadata, and status). Failed records include
   the full captured body, query, redacted headers, and error details for

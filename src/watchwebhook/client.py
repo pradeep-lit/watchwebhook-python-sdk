@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
 from threading import Lock
+from time import monotonic_ns
 from types import TracebackType
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -70,11 +71,13 @@ class WebhookEvent:
         event_id: str,
         payload: CapturedWebhook,
         occurred_at: datetime,
+        started_at_ns: int,
     ) -> None:
         self._client = client
         self._event_id = event_id
         self._payload = payload
         self._occurred_at = occurred_at
+        self._started_at_ns = started_at_ns
         self._finished = False
         self._lock = Lock()
 
@@ -85,8 +88,14 @@ class WebhookEvent:
 
     def success(self, *, status_code: int = 200) -> DeliveryResult:
         """Report that application processing completed successfully."""
+        finished_at_ns = monotonic_ns()
         status_code = _validate_status_code(status_code)
-        return self._finish(outcome="success", status_code=status_code, error=None)
+        return self._finish(
+            outcome="success",
+            status_code=status_code,
+            error=None,
+            finished_at_ns=finished_at_ns,
+        )
 
     def fail(
         self,
@@ -95,6 +104,7 @@ class WebhookEvent:
         status_code: int = 500,
     ) -> DeliveryResult:
         """Report a processing failure while leaving the original error untouched."""
+        finished_at_ns = monotonic_ns()
         status_code = _validate_status_code(status_code)
         if isinstance(error, BaseException):
             error_payload = self._client._exception_payload(error)
@@ -103,7 +113,10 @@ class WebhookEvent:
         else:
             raise TypeError("error must be a non-empty string or BaseException")
         return self._finish(
-            outcome="failure", status_code=status_code, error=error_payload
+            outcome="failure",
+            status_code=status_code,
+            error=error_payload,
+            finished_at_ns=finished_at_ns,
         )
 
     def _finish(
@@ -112,12 +125,17 @@ class WebhookEvent:
         outcome: WebhookOutcome,
         status_code: int,
         error: dict[str, Any] | None,
+        finished_at_ns: int,
     ) -> DeliveryResult:
         with self._lock:
             if self._finished:
                 raise WebhookAlreadyFinishedError(
                     f"webhook {self._event_id} has already been finished"
                 )
+            time_took_ms = round(
+                (finished_at_ns - self._started_at_ns) / 1_000_000,
+                3,
+            )
             self._finished = True
 
         payload = replace(
@@ -125,6 +143,7 @@ class WebhookEvent:
             outcome=outcome,
             status_code=status_code,
             error=error,
+            time_took_ms=time_took_ms,
         )
         return self._client._deliver(
             "webhook",
@@ -208,6 +227,7 @@ class WatchWebhook:
             raise ValueError("method must not be empty")
         if url is not None and not url.strip():
             raise ValueError("url must not be empty when provided")
+        received_at = occurred_at or utc_now()
 
         encoded_body, body_encoding = encode_webhook_body(body)
         payload = CapturedWebhook(
@@ -219,6 +239,8 @@ class WatchWebhook:
             body_encoding=body_encoding,
             source=source,
             metadata=to_json_safe(dict(metadata or {})),
+            received_at=received_at,
+            time_took_ms=None,
             status_code=None,
             error=None,
             outcome="pending",
@@ -227,7 +249,8 @@ class WatchWebhook:
             self,
             event_id=str(uuid4()),
             payload=payload,
-            occurred_at=occurred_at or utc_now(),
+            occurred_at=received_at,
+            started_at_ns=monotonic_ns(),
         )
 
     def capture_event(
@@ -317,6 +340,7 @@ class WatchWebhook:
                 response.read()
         except HTTPError as error:
             status_code = error.code
+            error.close()
             result = DeliveryResult(
                 event_id=event_id,
                 delivered=False,
